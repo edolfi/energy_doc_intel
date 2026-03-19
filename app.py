@@ -4,29 +4,8 @@ import anthropic
 import pandas as pd
 import io
 import os
-from pydantic import BaseModel
-from typing import Optional
-
-# ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Energy Document Intelligence",
-    page_icon="⚡",
-    layout="wide",
-)
-
-# ── Data model ────────────────────────────────────────────────────────────────
-class ProjectData(BaseModel):
-    project_name: Optional[str] = None
-    applicant_developer_name: Optional[str] = None
-    county: Optional[str] = None
-    state: Optional[str] = None
-    coordinates: Optional[str] = None
-    capacity_mw: Optional[str] = None
-    technology_type: Optional[str] = None
-    filing_or_permit_date: Optional[str] = None
-    approval_status: Optional[str] = None
-    key_conditions_or_modifications: Optional[str] = None
-    cost_figures: Optional[str] = None
+import json
+import re
 
 
 COLUMN_LABELS = {
@@ -69,7 +48,6 @@ def extract_fields_with_claude(
     text: str, filename: str, client: anthropic.Anthropic
 ) -> dict:
     """Send extracted PDF text to Claude and return structured fields."""
-    # Truncate to ~60K chars to stay well within context limits
     truncated = text[:60_000]
     truncation_note = (
         "\n\n[Note: document was truncated to fit context limits]"
@@ -78,7 +56,7 @@ def extract_fields_with_claude(
     )
 
     prompt = f"""You are analyzing a renewable energy project document.
-Extract the fields listed below from the document text. If a field is not present, return null.
+Extract the fields listed below from the document text. If a field is not present, use null.
 
 Document filename: {filename}{truncation_note}
 
@@ -86,28 +64,48 @@ Document filename: {filename}{truncation_note}
 {truncated}
 --- END DOCUMENT ---
 
-Fields to extract:
+Return ONLY a valid JSON object with exactly these keys (no markdown, no explanation):
+{{
+  "project_name": "...",
+  "applicant_developer_name": "...",
+  "county": "...",
+  "state": "...",
+  "coordinates": "...",
+  "capacity_mw": "...",
+  "technology_type": "...",
+  "filing_or_permit_date": "...",
+  "approval_status": "...",
+  "key_conditions_or_modifications": "...",
+  "cost_figures": "..."
+}}
+
+Field guidance:
 - project_name: Name of the solar/energy project
 - applicant_developer_name: Company or person who filed / is developing the project
 - county: County where the project is located
 - state: US state where the project is located
-- coordinates: GPS / lat-long coordinates if mentioned (e.g. "34.12°N, 118.40°W")
-- capacity_mw: Nameplate or AC capacity in megawatts — include units (e.g. "200 MW AC")
-- technology_type: Technology type (solar PV, battery storage, solar+storage, wind, etc.)
+- coordinates: GPS / lat-long coordinates if mentioned
+- capacity_mw: Nameplate or AC capacity in megawatts, include units (e.g. "200 MW AC")
+- technology_type: solar PV, battery storage, solar+storage, wind, etc.
 - filing_or_permit_date: Date the permit or application was filed
-- approval_status: Status of the project (approved, conditionally approved, pending, denied, etc.)
-- key_conditions_or_modifications: Key permit conditions, modifications, or notable requirements — summarize briefly
-- cost_figures: Any cost amounts mentioned (interconnection costs, project cost, fees, etc.)
+- approval_status: approved, conditionally approved, pending, denied, etc.
+- key_conditions_or_modifications: brief summary of key conditions or requirements
+- cost_figures: any cost amounts mentioned (interconnection costs, project cost, fees, etc.)
 """
 
-    response = client.messages.parse(
+    response = client.messages.create(
         model="claude-opus-4-6",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
-        output_format=ProjectData,
     )
 
-    result = response.parsed_output.model_dump()
+    raw = response.content[0].text.strip()
+
+    # Strip markdown code fences if Claude adds them anyway
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    result = json.loads(raw)
     result["filename"] = filename
     return result
 
