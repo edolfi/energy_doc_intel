@@ -7,6 +7,8 @@ import os
 import json
 import re
 
+import fitz  # PyMuPDF
+
 
 COLUMN_LABELS = {
     "filename": "File",
@@ -33,15 +35,34 @@ def get_api_key() -> str | None:
     return st.session_state.get("api_key")
 
 
-def extract_text_from_pdf(file) -> str:
+def extract_text_from_pdf(file_bytes: bytes) -> str:
     """Extract all text from a PDF using pdfplumber."""
     text_parts = []
-    with pdfplumber.open(file) as pdf:
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
                 text_parts.append(page_text)
     return "\n".join(text_parts)
+
+
+def extract_images_from_pdf(file_bytes: bytes) -> list[bytes]:
+    """Extract images from a PDF using PyMuPDF, skipping tiny decorative images."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    images = []
+    seen_xrefs = set()
+    for page in doc:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            base_image = doc.extract_image(xref)
+            img_bytes = base_image["image"]
+            # Skip tiny images (logos, icons, line art)
+            if len(img_bytes) >= 10_000:
+                images.append(img_bytes)
+    return images
 
 
 def extract_fields_with_claude(
@@ -76,7 +97,8 @@ Return ONLY a valid JSON object with exactly these keys (no markdown, no explana
   "filing_or_permit_date": "...",
   "approval_status": "...",
   "key_conditions_or_modifications": "...",
-  "cost_figures": "..."
+  "cost_figures": "...",
+  "summary": "..."
 }}
 
 Field guidance:
@@ -91,6 +113,7 @@ Field guidance:
 - approval_status: approved, conditionally approved, pending, denied, etc.
 - key_conditions_or_modifications: brief summary of key conditions or requirements
 - cost_figures: any cost amounts mentioned (interconnection costs, project cost, fees, etc.)
+- summary: 2-3 sentence plain-language summary of the project for a non-technical audience
 """
 
     response = client.messages.create(
@@ -111,9 +134,10 @@ Field guidance:
 
 
 def results_to_df(results: list[dict]) -> pd.DataFrame:
-    """Convert list of result dicts into a display-ready DataFrame."""
-    df = pd.DataFrame(results)
-    # Reorder so filename is first
+    """Convert list of result dicts into a display-ready DataFrame (excludes summary and images)."""
+    table_keys = list(COLUMN_LABELS.keys())
+    rows = [{k: r.get(k) for k in table_keys} for r in results]
+    df = pd.DataFrame(rows)
     cols = ["filename"] + [c for c in COLUMN_LABELS if c != "filename" and c in df.columns]
     df = df[cols]
     df = df.rename(columns=COLUMN_LABELS)
@@ -177,14 +201,20 @@ if uploaded_files and api_key:
             status_area.info(f"Processing **{filename}** ({i + 1}/{len(uploaded_files)})…")
 
             try:
+                file_bytes = uploaded_file.read()
+
                 # Step 1: extract text
-                pdf_text = extract_text_from_pdf(uploaded_file)
+                pdf_text = extract_text_from_pdf(file_bytes)
                 if not pdf_text.strip():
                     errors.append((filename, "No extractable text found — the PDF may be scanned/image-only."))
                     continue
 
-                # Step 2: call Claude
+                # Step 2: extract images
+                images = extract_images_from_pdf(file_bytes)
+
+                # Step 3: call Claude
                 fields = extract_fields_with_claude(pdf_text, filename, client)
+                fields["_images"] = images
                 results.append(fields)
 
             except anthropic.AuthenticationError:
@@ -211,15 +241,66 @@ if uploaded_files and api_key:
             st.success(f"Extracted fields from {len(results)} document(s).")
             df = results_to_df(results)
 
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            # Tab names: "All Projects" + one per project
+            def short_name(r):
+                name = r.get("project_name") or r["filename"]
+                return name[:30] + "…" if len(name) > 30 else name
 
-            st.download_button(
-                label="Download CSV",
-                data=df_to_csv_bytes(df),
-                file_name="energy_document_extractions.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            tab_names = ["All Projects"] + [short_name(r) for r in results]
+            tabs = st.tabs(tab_names)
+
+            # ── All Projects tab ──────────────────────────────────────────────
+            with tabs[0]:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    label="Download CSV",
+                    data=df_to_csv_bytes(df),
+                    file_name="energy_document_extractions.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            # ── Per-project tabs ──────────────────────────────────────────────
+            for i, result in enumerate(results):
+                with tabs[i + 1]:
+                    # Summary
+                    summary = result.get("summary")
+                    if summary:
+                        st.info(summary)
+
+                    # Key fields in two columns
+                    col1, col2 = st.columns(2)
+                    field_pairs = [
+                        ("Project Name", result.get("project_name")),
+                        ("Applicant / Developer", result.get("applicant_developer_name")),
+                        ("County", result.get("county")),
+                        ("State", result.get("state")),
+                        ("Capacity (MW)", result.get("capacity_mw")),
+                        ("Technology", result.get("technology_type")),
+                        ("Filing / Permit Date", result.get("filing_or_permit_date")),
+                        ("Approval Status", result.get("approval_status")),
+                        ("Coordinates", result.get("coordinates")),
+                        ("Cost Figures", result.get("cost_figures")),
+                    ]
+                    for j, (label, value) in enumerate(field_pairs):
+                        target_col = col1 if j % 2 == 0 else col2
+                        target_col.metric(label, value or "—")
+
+                    # Key conditions (can be long — full width)
+                    conditions = result.get("key_conditions_or_modifications")
+                    if conditions and conditions != "null":
+                        st.markdown("**Key Conditions / Modifications**")
+                        st.write(conditions)
+
+                    # Images
+                    images = result.get("_images", [])
+                    if images:
+                        st.markdown(f"**Maps & Images** ({len(images)} extracted)")
+                        for img_bytes in images:
+                            st.image(img_bytes, use_container_width=True)
+                    else:
+                        st.caption("No images found in this document.")
+
         elif not errors:
             st.warning("No results were extracted.")
 
