@@ -7,7 +7,10 @@ import os
 import json
 import re
 
+import base64
+
 import fitz  # PyMuPDF
+from PIL import Image
 
 
 COLUMN_LABELS = {
@@ -46,13 +49,33 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
+MAX_IMAGE_DIM = 1400   # max width or height in pixels before resizing
+MAX_IMAGES = 15        # max images to extract per document
+
+
+def resize_image(img_bytes: bytes) -> bytes:
+    """Resize an image to fit within MAX_IMAGE_DIM, converting CMYK to RGB if needed."""
+    img = Image.open(io.BytesIO(img_bytes))
+    if img.mode in ("CMYK", "P"):
+        img = img.convert("RGB")
+    if max(img.size) > MAX_IMAGE_DIM:
+        img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=75, optimize=True)
+    return buf.getvalue()
+
+
 def extract_images_from_pdf(file_bytes: bytes) -> list[bytes]:
-    """Extract images from a PDF using PyMuPDF, skipping tiny decorative images."""
+    """Extract images from a PDF using PyMuPDF, resizing large ones."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
     seen_xrefs = set()
     for page in doc:
+        if len(images) >= MAX_IMAGES:
+            break
         for img in page.get_images(full=True):
+            if len(images) >= MAX_IMAGES:
+                break
             xref = img[0]
             if xref in seen_xrefs:
                 continue
@@ -60,9 +83,39 @@ def extract_images_from_pdf(file_bytes: bytes) -> list[bytes]:
             base_image = doc.extract_image(xref)
             img_bytes = base_image["image"]
             # Skip tiny images (logos, icons, line art)
-            if len(img_bytes) >= 10_000:
-                images.append(img_bytes)
+            if len(img_bytes) < 10_000:
+                continue
+            try:
+                images.append(resize_image(img_bytes))
+            except Exception:
+                continue  # skip unreadable images
     return images
+
+
+def is_map_image(img_bytes: bytes, client: anthropic.Anthropic) -> bool:
+    """Use Claude Haiku vision to check if an image looks like a map, aerial photo, or site plan."""
+    img_b64 = base64.standard_b64encode(img_bytes).decode()
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Does this image look like a map, aerial photo, site plan, or project location diagram? Reply YES or NO only.",
+                    },
+                ],
+            }],
+        )
+        return response.content[0].text.strip().upper().startswith("Y")
+    except Exception:
+        return False  # skip on any error
 
 
 def extract_fields_with_claude(
@@ -209,10 +262,12 @@ if uploaded_files and api_key:
                     errors.append((filename, "No extractable text found — the PDF may be scanned/image-only."))
                     continue
 
-                # Step 2: extract images
-                images = extract_images_from_pdf(file_bytes)
+                # Step 2: extract images, then filter to maps only
+                all_images = extract_images_from_pdf(file_bytes)
+                status_area.info(f"Classifying images in **{filename}**…")
+                images = [img for img in all_images if is_map_image(img, client)]
 
-                # Step 3: call Claude
+                # Step 3: call Claude for structured fields
                 fields = extract_fields_with_claude(pdf_text, filename, client)
                 fields["_images"] = images
                 results.append(fields)
